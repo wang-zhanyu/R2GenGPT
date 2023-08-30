@@ -32,8 +32,12 @@ def train(args):
     else:
         model = R2GenGPT(args)
 
-    trainer.fit(model, datamodule=dm)
-
+    if args.test:
+        trainer.test(model, datamodule=dm)
+    elif args.validate:
+        trainer.validate(model, datamodule=dm)
+    else:
+        trainer.fit(model, datamodule=dm)
 
 def main():
     args = parser.parse_args()

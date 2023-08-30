@@ -92,7 +92,7 @@ class ParseDataset(data.Dataset):
 
 def create_datasets(args):
     train_dataset = ParseDataset(args, 'train')
-    dev_dataset = ParseDataset(args, 'test')
+    dev_dataset = ParseDataset(args, 'val')
     test_dataset = ParseDataset(args, 'test')
     return train_dataset, dev_dataset, test_dataset
 

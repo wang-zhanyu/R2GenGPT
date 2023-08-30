@@ -68,6 +68,6 @@ class DataModule(LightningDataModule):
 
 
     def test_dataloader(self):
-        loader = DataLoader(self.dataset["test"], batch_size=self.args.val_batch_size, drop_last=False, pin_memory=False,
+        loader = DataLoader(self.dataset["test"], batch_size=self.args.test_batch_size, drop_last=False, pin_memory=False,
                         num_workers=self.args.num_workers, prefetch_factor=self.args.prefetch_factor)
         return loader

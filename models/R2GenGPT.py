@@ -79,6 +79,7 @@ class R2GenGPT(pl.LightningModule):
         self.end_sym = args.end_sym
         self.prompt = 'Generate a comprehensive and detailed diagnosis report for this chest xray image.'
         self.val_step_outputs = []
+        self.test_step_outputs = []
         self.val_score = 0.0
 
         if args.delta_file is not None:
@@ -262,7 +263,7 @@ class R2GenGPT(pl.LightningModule):
         ref = {k:[v] for k, v in zip(ids, ref)}
         hypo = {k:[v] for k, v in zip(ids, hypo)}
         eval_res = self.score(ref=ref,hypo=hypo)
-        self.log_dict(eval_res, logger=True)
+        self.log_dict(eval_res, sync_dist=True, logger=True)
 
         result_folder = os.path.join(self.hparams.savedmodel_path, 'result')
         os.makedirs(result_folder, exist_ok=True)
@@ -280,6 +281,61 @@ class R2GenGPT(pl.LightningModule):
             # if val_score > self.val_score:
             #     self.save_checkpoint(eval_res)
             #     self.val_score = val_score
+        self.val_step_outputs.clear()
+
+
+    def test_step(self, samples, batch_idx):
+        ref = samples['input_text']
+        image = samples["image"]
+        img_embeds, atts_img = self.encode_img(image)
+        img_embeds = self.layer_norm(img_embeds)
+        img_embeds, atts_img = self.prompt_wrap(img_embeds, atts_img)
+
+        batch_size = img_embeds.shape[0]
+        bos = torch.ones([batch_size, 1],
+                         dtype=atts_img.dtype,
+                         device=atts_img.device) * self.llama_tokenizer.bos_token_id
+        bos_embeds = self.embed_tokens(bos)
+        atts_bos = atts_img[:, :1]
+
+        inputs_embeds = torch.cat([bos_embeds, img_embeds], dim=1)
+        attention_mask = torch.cat([atts_bos, atts_img], dim=1)
+
+        outputs = self.llama_model.generate(
+            inputs_embeds=inputs_embeds,
+            num_beams=self.hparams.beam_size,
+            do_sample=self.hparams.do_sample,
+            min_new_tokens=self.hparams.min_new_tokens,
+            max_new_tokens=self.hparams.max_new_tokens,
+            repetition_penalty=self.hparams.repetition_penalty,
+            length_penalty=self.hparams.length_penalty,
+            temperature=self.hparams.temperature,
+        )
+        hypo = [self.decode(i) for i in outputs]
+        self.test_step_outputs.append({"hypo": hypo, "ref": ref, "id": samples["id"]})
+        return hypo, ref
+
+
+    def on_test_epoch_end(self):
+        """
+        This function is called at the end of the test epoch.
+        It is recommended to test on single device to ensure each sample/batch gets evaluated exactly once. This is helpful to make sure benchmarking for research papers is done the right way. Otherwise, in a multi-device setting, samples could occur duplicated when DistributedSampler is used, for eg. with strategy="ddp". It replicates some samples on some devices to make sure all devices have same batch size in case of uneven inputs.
+        """
+        ref, hypo, ids = [], [], []
+        for i in self.test_step_outputs:
+            ref.extend(i['ref'])
+            hypo.extend(i['hypo'])
+            ids.extend(i['id'])
+
+        ref = {k:[v] for k, v in zip(ids, ref)}
+        hypo = {k:[v] for k, v in zip(ids, hypo)}
+        eval_res = self.score(ref=ref,hypo=hypo)
+
+        result_folder = os.path.join(self.hparams.savedmodel_path, 'result')
+        os.makedirs(result_folder, exist_ok=True)
+        json.dump(hypo, open(os.path.join(result_folder, f"test_result.json"), 'w'))
+        json.dump(ref, open(os.path.join(result_folder, 'refs.json'), 'w'))
+        self.print(f"Test result: {eval_res}")
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
