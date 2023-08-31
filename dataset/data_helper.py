@@ -26,7 +26,7 @@ class FieldParser:
     # from https://github.com/cuhksz-nlp/R2Gen/blob/main/modules/tokenizers.py
     def clean_report(self, report):
         # clean Iu-xray reports
-        if self.dataset == "iu-xray":
+        if self.dataset == "iu_xray":
             report_cleaner = lambda t: t.replace('..', '.').replace('..', '.').replace('..', '.').replace('1. ', '') \
             .replace('. 2. ', '. ').replace('. 3. ', '. ').replace('. 4. ', '. ').replace('. 5. ', '. ') \
             .replace(' 2. ', '. ').replace(' 3. ', '. ').replace(' 4. ', '. ').replace(' 5. ', '. ') \
@@ -48,9 +48,8 @@ class FieldParser:
             sent_cleaner = lambda t: re.sub('[.,?;*!%^&_+()\[\]{}]', '', t.replace('"', '').replace('/', '')
                                 .replace('\\', '').replace("'", '').strip().lower())
             tokens = [sent_cleaner(sent) for sent in report_cleaner(report) if sent_cleaner(sent) != []]
-            report = ' . '.join(tokens) + ' .'
-            
-        report = ' '.join(report.split()[:self.args.max_txt_len])
+            report = ' . '.join(tokens) + ' .' 
+        # report = ' '.join(report.split()[:self.args.max_txt_len])
         return report
 
 

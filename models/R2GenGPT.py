@@ -14,6 +14,7 @@ from peft import get_peft_model, LoraConfig, TaskType
 import pdb
 
 
+
 class R2GenGPT(pl.LightningModule):
     """
     R2GenGPT model.
@@ -87,6 +88,7 @@ class R2GenGPT(pl.LightningModule):
             self.load_state_dict(state_dict=state_dict, strict=False)
             print(f'Load checkpoint from {args.delta_file}')
 
+
     def score(self, ref, hypo):
         """
         ref, dictionary of reference sentences (id, sentence)
@@ -109,6 +111,7 @@ class R2GenGPT(pl.LightningModule):
                 final_scores[method] = score
         return final_scores
 
+
     def encode_img(self, images):
         image_embeds = []
         for image in images:
@@ -124,6 +127,7 @@ class R2GenGPT(pl.LightningModule):
         atts_llama = torch.ones(inputs_llama.size()[:-1], dtype=torch.long).to(image.device)
         return inputs_llama, atts_llama
 
+
     def prompt_wrap(self, img_embeds, atts_img):
         prompt=f'Human: <Img><ImageHere></Img> {self.prompt} \nAssistant:'
         batch_size = img_embeds.shape[0]
@@ -138,6 +142,7 @@ class R2GenGPT(pl.LightningModule):
         wrapped_atts_img = atts_img[:, :1].expand(-1, wrapped_img_embeds.shape[1])
         return wrapped_img_embeds, wrapped_atts_img
 
+
     def forward(self, samples):
         image = samples["image"]
         img_embeds, atts_img = self.encode_img(image)
@@ -151,7 +156,9 @@ class R2GenGPT(pl.LightningModule):
         to_regress_tokens = self.llama_tokenizer(
             text,
             return_tensors="pt",
-            padding="longest",
+            padding="max_length",
+            truncation=True,
+            max_length=self.hparams.max_length,
             add_special_tokens=False
         ).to(image[0].device)
 
@@ -214,7 +221,16 @@ class R2GenGPT(pl.LightningModule):
         torch.save(save_obj, save_to)
     
     def validation_step(self, samples, batch_idx):
-        ref = samples['input_text']
+        self.llama_tokenizer.padding_side = "right"
+        to_regress_tokens = self.llama_tokenizer(
+            samples['input_text'],
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=self.hparams.max_length,
+            add_special_tokens=False
+        )
+
         image = samples["image"]
         img_embeds, atts_img = self.encode_img(image)
         img_embeds = self.layer_norm(img_embeds)
@@ -241,6 +257,7 @@ class R2GenGPT(pl.LightningModule):
             temperature=self.hparams.temperature,
         )
         hypo = [self.decode(i) for i in outputs]
+        ref = [self.decode(i) for i in to_regress_tokens['input_ids']]
         self.val_step_outputs.append({"hypo": hypo, "ref": ref, "id": samples["id"]})
         return hypo, ref
     
@@ -251,6 +268,7 @@ class R2GenGPT(pl.LightningModule):
             output_token = output_token[1:]
         output_text = self.llama_tokenizer.decode(output_token, add_special_tokens=False)
         output_text = output_text.split('</s>')[0].strip()
+        output_text = output_text.replace('<unk>', '')
         return output_text
 
     def on_validation_epoch_end(self):
@@ -277,15 +295,23 @@ class R2GenGPT(pl.LightningModule):
             val_score += eval_res[score_type] * weight
 
         if self.trainer.local_rank == 0:
-            self.save_checkpoint(eval_res)
-            # if val_score > self.val_score:
-            #     self.save_checkpoint(eval_res)
-            #     self.val_score = val_score
+            if val_score > self.val_score:
+                self.save_checkpoint(eval_res)
+                self.val_score = val_score
         self.val_step_outputs.clear()
 
 
     def test_step(self, samples, batch_idx):
-        ref = samples['input_text']
+        self.llama_tokenizer.padding_side = "right"
+        to_regress_tokens = self.llama_tokenizer(
+            samples['input_text'],
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=self.hparams.max_length,
+            add_special_tokens=False
+        )
+
         image = samples["image"]
         img_embeds, atts_img = self.encode_img(image)
         img_embeds = self.layer_norm(img_embeds)
@@ -312,6 +338,7 @@ class R2GenGPT(pl.LightningModule):
             temperature=self.hparams.temperature,
         )
         hypo = [self.decode(i) for i in outputs]
+        ref = [self.decode(i) for i in to_regress_tokens['input_ids']]
         self.test_step_outputs.append({"hypo": hypo, "ref": ref, "id": samples["id"]})
         return hypo, ref
 
@@ -334,8 +361,8 @@ class R2GenGPT(pl.LightningModule):
         result_folder = os.path.join(self.hparams.savedmodel_path, 'result')
         os.makedirs(result_folder, exist_ok=True)
         json.dump(hypo, open(os.path.join(result_folder, f"test_result.json"), 'w'))
-        json.dump(ref, open(os.path.join(result_folder, 'refs.json'), 'w'))
-        self.print(f"Test result: {eval_res}")
+        json.dump(ref, open(os.path.join(result_folder, 'test_refs.json'), 'w'))
+        self.print(f"Test result of {self.hparams.delta_file}: {eval_res}")
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
