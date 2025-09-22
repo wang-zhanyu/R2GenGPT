@@ -12,7 +12,7 @@ from transformers import SwinModel
 from lightning_tools.optim import config_optimizer
 from peft import get_peft_model, LoraConfig, TaskType
 import pdb
-
+from transformers import LlamaForCausalLM, BitsAndBytesConfig
 
 
 class R2GenGPT(pl.LightningModule):
@@ -48,17 +48,24 @@ class R2GenGPT(pl.LightningModule):
         print('Loading LLAMA')
         self.llama_tokenizer = LlamaTokenizer.from_pretrained(args.llama_model, use_fast=False)
         self.llama_tokenizer.pad_token_id = 0
+
+        ##change to use float 32
+
         if args.low_resource:
-            self.llama_model = LlamaForCausalLM.from_pretrained(
-                args.llama_model,
-                torch_dtype=torch.float16,
-                load_in_8bit=True,
-                device_map="auto"
-            )
+          bnb_config = BitsAndBytesConfig(
+              load_in_8bit=True,
+              llm_int8_threshold=6.0  # optional threshold
+          )
+          self.llama_model = LlamaForCausalLM.from_pretrained(
+              args.llama_model,
+              quantization_config=bnb_config,  # <- new recommended argument
+              device_map="auto",
+              torch_dtype=torch.float32       # FP16 saves memory
+          )
         else:
             self.llama_model = LlamaForCausalLM.from_pretrained(
                 args.llama_model,
-                torch_dtype=torch.float16,
+                dtype=torch.float32,
             )
          
         if args.llm_use_lora:
@@ -83,10 +90,20 @@ class R2GenGPT(pl.LightningModule):
         self.test_step_outputs = []
         self.val_score = 0.0
 
+        # if args.delta_file is not None:
+        #     state_dict = torch.load(args.delta_file, map_location=torch.device(f'cuda:{torch.cuda.current_device()}'))['model']
+        #     self.load_state_dict(state_dict=state_dict, strict=False)
+        #     print(f'Load checkpoint from {args.delta_file}')
         if args.delta_file is not None:
-            state_dict = torch.load(args.delta_file, map_location=torch.device(f'cuda:{torch.cuda.current_device()}'))['model']
+    # Select device: MPS if available, otherwise CPU
+            if torch.backends.mps.is_available():
+                device = torch.device("mps")
+            else:
+                device = torch.device("cpu")
+
+            state_dict = torch.load(args.delta_file, map_location=device,weights_only=False)['model']
             self.load_state_dict(state_dict=state_dict, strict=False)
-            print(f'Load checkpoint from {args.delta_file}')
+            print(f'Load checkpoint from {args.delta_file} on device {device}')
 
 
     def score(self, ref, hypo):
@@ -112,7 +129,7 @@ class R2GenGPT(pl.LightningModule):
         return final_scores
 
 
-    def encode_img(self, images):
+    def encode_img1(self, images):
         image_embeds = []
         for image in images:
             device = image.device
@@ -125,6 +142,66 @@ class R2GenGPT(pl.LightningModule):
         image_embeds = torch.stack(image_embeds).mean(0)
         inputs_llama = self.llama_proj(image_embeds)
         atts_llama = torch.ones(inputs_llama.size()[:-1], dtype=torch.long).to(image.device)
+        return inputs_llama, atts_llama
+    def normalize_images(self, images):
+    # images: Tensor of shape [B, C, H, W] in range [0, 255] or arbitrary range
+    # convert to [0,1] first if needed
+        if images.max() > 1.0:
+            images = images / 255.0
+
+        mean = torch.tensor([0.485, 0.456, 0.406], device=images.device).view(1,3,1,1)
+        std  = torch.tensor([0.229, 0.224, 0.225], device=images.device).view(1,3,1,1)
+
+        return (images - mean) / std
+
+    ##diagnosieing the thingy
+    def encode_img(self, images):
+        image_embeds = []
+        print("cecececec")
+        print("Image dtype:", images[0].dtype)
+        print("Model dtype:", self.visual_encoder.dtype)
+
+        # Check weights
+        for name, param in self.visual_encoder.named_parameters():
+            if torch.isnan(param).any():
+                print(f"NaN in weight: {name}")
+
+
+        for i, image in enumerate(images):
+            device = image.device
+            print(f"[Image {i}] stats before normalize: min={image.min()}, max={image.max()}, mean={image.mean()}, std={image.std()}")
+            print(f"[Image {i}] NaNs: {torch.isnan(image).any()}, Infs: {torch.isinf(image).any()}")
+            # Check dtype of your image and model
+            #image = self.normalize_images(image)
+
+            # Check raw image stats
+            print(f"[Image {i}] stats after normalize: min={image.min()}, max={image.max()}, mean={image.mean()}, std={image.std()}")
+            print(f"[Image {i}] NaNs: {torch.isnan(image).any()}, Infs: {torch.isinf(image).any()}")
+            # Visual encoder
+            #image = torch.randn_like(image)
+            if self.hparams.global_only:
+                image_embed = self.visual_encoder(image)['pooler_output'].unsqueeze(1).to(device)
+            else:
+                image_embed = self.visual_encoder(image)['last_hidden_state'].to(device)
+
+            print(f"[Image {i}] Visual encoder output shape: {image_embed.shape}")
+            print("embed NaNs:", torch.isnan(image_embed).any(), "Infs:", torch.isinf(image_embed).any())
+            
+            image_embeds.append(image_embed)
+
+        # Stack and average
+        image_embeds = torch.stack(image_embeds).mean(0)
+        print("After stack & mean:", image_embeds.shape)
+        print("Stack NaNs:", torch.isnan(image_embeds).any(), "Infs:", torch.isinf(image_embeds).any())
+
+        # Projection to LLaMA hidden size
+        inputs_llama = self.llama_proj(image_embeds)
+        print("inputs_llama shape:", inputs_llama.shape)
+        print("Input NaNs:", torch.isnan(inputs_llama).any(), "Infs:", torch.isinf(inputs_llama).any())
+
+        # Attention mask
+        atts_llama = torch.ones(inputs_llama.size()[:-1], dtype=torch.long).to(device)
+        
         return inputs_llama, atts_llama
 
 
@@ -303,6 +380,8 @@ class R2GenGPT(pl.LightningModule):
 
     def test_step(self, samples, batch_idx):
         self.llama_tokenizer.padding_side = "right"
+        print ("ceceefncowe")
+        print ("samples", samples)
         to_regress_tokens = self.llama_tokenizer(
             samples['input_text'],
             return_tensors="pt",
@@ -313,9 +392,19 @@ class R2GenGPT(pl.LightningModule):
         )
 
         image = samples["image"]
+        print(image[0].shape)
         img_embeds, atts_img = self.encode_img(image)
+        print({"fefe23"})
+        print("inputs_embeds:", img_embeds.shape,
+        "mean:", img_embeds.mean().item(),
+        "std:", img_embeds.std().item(),
+        "min:", img_embeds.min().item(),
+        "max:", img_embeds.max().item())
+        print("hello3")
+
         img_embeds = self.layer_norm(img_embeds)
         img_embeds, atts_img = self.prompt_wrap(img_embeds, atts_img)
+
 
         batch_size = img_embeds.shape[0]
         bos = torch.ones([batch_size, 1],
@@ -326,7 +415,22 @@ class R2GenGPT(pl.LightningModule):
 
         inputs_embeds = torch.cat([bos_embeds, img_embeds], dim=1)
         attention_mask = torch.cat([atts_bos, atts_img], dim=1)
-
+        print({"fefe"})
+        print("inputs_embeds:", inputs_embeds.shape,
+        "mean:", inputs_embeds.mean().item(),
+        "std:", inputs_embeds.std().item(),
+        "min:", inputs_embeds.min().item(),
+        "max:", inputs_embeds.max().item())
+        print("hello1")
+    ##add to trin on mpos to use float 32
+        inputs_embeds = inputs_embeds.to(torch.float32)
+        print({"fefe"})
+        print("inputs_embeds:", inputs_embeds.shape,
+        "mean:", inputs_embeds.mean().item(),
+        "std:", inputs_embeds.std().item(),
+        "min:", inputs_embeds.min().item(),
+        "max:", inputs_embeds.max().item())
+        print("hello")
         outputs = self.llama_model.generate(
             inputs_embeds=inputs_embeds,
             num_beams=self.hparams.beam_size,
@@ -337,9 +441,12 @@ class R2GenGPT(pl.LightningModule):
             length_penalty=self.hparams.length_penalty,
             temperature=self.hparams.temperature,
         )
+
         hypo = [self.decode(i) for i in outputs]
         ref = [self.decode(i) for i in to_regress_tokens['input_ids']]
         self.test_step_outputs.append({"hypo": hypo, "ref": ref, "id": samples["id"]})
+        print ("hypo", hypo)
+        print ("ref", ref)
         return hypo, ref
 
 
